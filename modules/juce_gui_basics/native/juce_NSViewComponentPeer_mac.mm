@@ -32,6 +32,8 @@
   ==============================================================================
 */
 
+#import <QuartzCore/QuartzCore.h> // for [CATransaction flush] in sendDragCallback()
+
 @interface NSEvent (DeviceDelta)
 - (float)deviceDeltaX;
 - (float)deviceDeltaY;
@@ -1485,16 +1487,19 @@ public:
 
     BOOL sendDragCallback (bool (ComponentPeer::* callback) (const DragInfo&), id <NSDraggingInfo> sender)
     {
+        const bool isExit = callback == &NSViewComponentPeer::handleDragExit;
+        const bool isDrop = callback == &NSViewComponentPeer::handleDragDrop;
+
         if (callback == &NSViewComponentPeer::handleDragMove)
             draggingActive = true;
 
-        if (callback == &NSViewComponentPeer::handleDragExit || callback == &NSViewComponentPeer::handleDragDrop)
+        if (isExit || isDrop)
             draggingActive = false;
 
         NSPasteboard* pasteboard = [sender draggingPasteboard];
         NSString* contentType = [pasteboard availableTypeFromArray: getSupportedDragTypes()];
 
-        if (contentType == nil)
+        if (contentType == nil && ! isExit)
             return false;
 
         const auto p = localToGlobal (convertToPointFloat ([view convertPoint: [sender draggingLocation] fromView: nil]));
@@ -1502,15 +1507,90 @@ public:
         ComponentPeer::DragInfo dragInfo;
         dragInfo.position = detail::ScalingHelpers::screenPosToLocalPos (component, p).roundToInt();
 
-        if (contentType == NSPasteboardTypeString)
-            dragInfo.text = nsStringToJuce ([pasteboard stringForType: NSPasteboardTypeString]);
-        else
-            dragInfo.files = getDroppedFiles (pasteboard, contentType);
+        if (contentType != nil)
+        {
+            // A generic macOS file promise (e.g. a Pro Tools Edit Window clip, which
+            // is rendered on drop -> "Preparing Clips…"). The real file only exists
+            // once we request it at drop time, so it needs separate handling from the
+            // iTunes-promise / plain file-URL cases in getDroppedFiles().
+            NSString* iTunesType = nsStringLiteral ("CorePasteboardFlavorType 0x6974756E"); // 'itun'
+            const bool isGenericPromise =
+                [contentType isEqualToString: (NSString*) kPasteboardTypeFileURLPromise]
+                 && ! [[pasteboard types] containsObject: iTunesType];
+
+            if (contentType == NSPasteboardTypeString)
+                dragInfo.text = nsStringToJuce ([pasteboard stringForType: NSPasteboardTypeString]);
+            else if (isGenericPromise)
+                dragInfo.files = getPromisedFiles (sender, isDrop);
+            else
+                dragInfo.files = getDroppedFiles (pasteboard, contentType);
+        }
+
+        // When a drag session ends, the pasteboard can stop reporting a supported
+        // type before draggingExited/draggingEnded reaches us (seen with Pro Tools
+        // Edit Window clip drags, which are macOS file promises). If the exit were
+        // dropped here, FileDragAndDropTargets would never receive fileDragExit()
+        // and would keep their drag highlight on forever. Fall back to the content
+        // captured while the drag was in flight so the exit is always delivered.
+        if (isExit && dragInfo.isEmpty())
+        {
+            dragInfo.files = activeDragInfo.files;
+            dragInfo.text  = activeDragInfo.text;
+        }
+
+        if (isExit)
+            activeDragInfo.clear();       // session over; don't let stale info leak into the next drag
+        else if (! isDrop)
+            activeDragInfo = dragInfo;    // remember the in-flight drag for the exit fallback above
 
         if (! dragInfo.isEmpty())
-            return (this->*callback) (dragInfo);
+        {
+            const bool handled = (this->*callback) (dragInfo);
+
+            // Drags that originate inside the host (e.g. a clip dragged from the
+            // Pro Tools Edit Window) run a modal drag-tracking loop on the host's
+            // main thread, which starves JUCE's asynchronous vblank repaint
+            // dispatch until the mouse is released. Anything the drag target
+            // repainted in response to this callback (drop highlights etc.) would
+            // otherwise stay invisible for the whole drag, so flush the repaint
+            // synchronously from inside the drag event itself.
+            setNeedsDisplayRectangles();
+            [view displayIfNeeded];
+            [CATransaction flush];
+
+            return handled;
+        }
 
         return false;
+    }
+
+    // Resolve a generic file-promise drag. On the actual drop we ask the drag
+    // source to materialise the promised file(s) into a temp directory (this is
+    // what makes Pro Tools write the rendered clip). During enter/move the file
+    // does not exist yet, so we advertise a placeholder with an audio extension
+    // so the host accepts the drag and later delivers the drop.
+    StringArray getPromisedFiles (id <NSDraggingInfo> sender, bool isDrop)
+    {
+        StringArray files;
+
+        if (isDrop)
+        {
+            NSURL* destDir = [NSURL fileURLWithPath: NSTemporaryDirectory() isDirectory: YES];
+
+            JUCE_BEGIN_IGNORE_DEPRECATION_WARNINGS
+            NSArray* names = [sender namesOfPromisedFilesDroppedAtDestination: destDir];
+            JUCE_END_IGNORE_DEPRECATION_WARNINGS
+
+            for (id name in names)
+                if ([name isKindOfClass: [NSString class]])
+                    files.add (nsStringToJuce ([[destDir URLByAppendingPathComponent: (NSString*) name] path]));
+        }
+        else
+        {
+            files.add ("dropped-clip.wav"); // placeholder so isInterestedInFileDrag() accepts the drag
+        }
+
+        return files;
     }
 
     StringArray getDroppedFiles (NSPasteboard* pasteboard, NSString* contentType)
@@ -1752,6 +1832,7 @@ public:
     bool isAlwaysOnTop = false, wasAlwaysOnTop = false, inBecomeKeyWindow = false;
     bool inPerformKeyEquivalent = false;
     bool draggingActive = false;
+    ComponentPeer::DragInfo activeDragInfo; // content of the drag currently over the view (see sendDragCallback)
     String stringBeingComposed;
     int startOfMarkedTextInTextInputTarget = 0;
 
